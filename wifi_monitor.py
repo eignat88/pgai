@@ -34,6 +34,9 @@ CSV_FIELDS = [
     "ssid",
     "bssid",
     "signal",
+    "signal_percent",
+    "signal_dbm",
+    "signal_quality",
     "radio_type",
     "channel",
     "rx_rate",
@@ -46,6 +49,9 @@ CSV_FIELDS = [
     "is_connected",
     "is_internet_available",
     "error_count",
+    "fail_count",
+    "network_status",
+    "outage_duration_sec",
     "event",
     "error",
 ]
@@ -59,6 +65,7 @@ class MonitorState:
     previous_internet: bool | None = None
     outage_active: bool = False
     consecutive_failures: int = 0
+    outage_started_at: float | None = None
 
 
 @dataclass
@@ -218,6 +225,48 @@ def choose_ping_result(targets: list[str]) -> dict[str, Any]:
     return failures[0] if failures else {"target": "", "ping_status": "FAIL", "latency_ms": "", "packet_loss": "", "error": "no_targets"}
 
 
+def parse_signal_percent(signal: str) -> int | None:
+    if not signal:
+        return None
+    cleaned = signal.replace("%", "").strip()
+    if not cleaned.isdigit():
+        return None
+    return int(cleaned)
+
+
+def classify_signal_quality(signal_dbm: int | None) -> str:
+    if signal_dbm is None:
+        return ""
+    if signal_dbm >= -60:
+        return "Отличное"
+    if -67 <= signal_dbm <= -61:
+        return "Хорошее"
+    if -75 <= signal_dbm <= -68:
+        return "Слабое"
+    return "Плохое"
+
+
+def resolve_network_status(
+    row: dict[str, Any],
+    latency_threshold_ms: int,
+    failures_before_outage: int,
+    consecutive_failures: int,
+) -> str:
+    if not row.get("is_connected"):
+        return "Wi‑Fi отключен"
+    if row.get("ping_status") == "FAIL" or not row.get("is_internet_available"):
+        return "Нет интернета"
+    latency = row.get("latency_ms")
+    if isinstance(latency, int) and latency > latency_threshold_ms:
+        return "Высокая задержка"
+    if consecutive_failures >= failures_before_outage:
+        return "Нестабильная сеть"
+    signal_dbm = row.get("signal_dbm")
+    if isinstance(signal_dbm, int) and signal_dbm < -75:
+        return "Слабый сигнал"
+    return "Нормально"
+
+
 def detect_event(state: MonitorState, row: dict[str, Any], failures_before_outage: int, latency_threshold_ms: int) -> str:
     events: list[str] = []
     connected = bool(row["is_connected"])
@@ -322,6 +371,9 @@ def main() -> int:
             "ssid": "",
             "bssid": "",
             "signal": "",
+            "signal_percent": "",
+            "signal_dbm": "",
+            "signal_quality": "",
             "radio_type": "",
             "channel": "",
             "rx_rate": "",
@@ -334,6 +386,9 @@ def main() -> int:
             "is_connected": False,
             "is_internet_available": False,
             "error_count": 0,
+            "fail_count": 0,
+            "network_status": "Нормально",
+            "outage_duration_sec": 0,
             "event": "",
             "error": "",
         }
@@ -350,6 +405,13 @@ def main() -> int:
             internet_ok = row["ping_status"] == "OK"
             row["is_internet_available"] = internet_ok
 
+            signal_percent = parse_signal_percent(str(row.get("signal", "")))
+            if signal_percent is not None:
+                row["signal_percent"] = signal_percent
+                signal_dbm = int(round((signal_percent / 2) - 100))
+                row["signal_dbm"] = signal_dbm
+                row["signal_quality"] = classify_signal_quality(signal_dbm)
+
             failed = (not row["is_connected"]) or (not row["ssid"]) or (not internet_ok)
             latency = row.get("latency_ms")
             if isinstance(latency, int) and latency > latency_threshold_ms:
@@ -357,12 +419,33 @@ def main() -> int:
 
             state.consecutive_failures = state.consecutive_failures + 1 if failed else 0
             row["error_count"] = state.consecutive_failures
+            row["fail_count"] = state.consecutive_failures
+
+            row["network_status"] = resolve_network_status(
+                row,
+                latency_threshold_ms=latency_threshold_ms,
+                failures_before_outage=failures_before_outage,
+                consecutive_failures=state.consecutive_failures,
+            )
+
+            if state.consecutive_failures >= failures_before_outage:
+                if state.outage_started_at is None:
+                    state.outage_started_at = time.time()
+                row["outage_duration_sec"] = int(time.time() - state.outage_started_at)
+            else:
+                state.outage_started_at = None
+                row["outage_duration_sec"] = 0
 
             row["event"] = detect_event(state, row, failures_before_outage, latency_threshold_ms)
 
         except Exception as exc:  # noqa: BLE001
             state.consecutive_failures += 1
             row["error_count"] = state.consecutive_failures
+            row["fail_count"] = state.consecutive_failures
+            row["network_status"] = "Нестабильная сеть"
+            if state.outage_started_at is None:
+                state.outage_started_at = time.time()
+            row["outage_duration_sec"] = int(time.time() - state.outage_started_at)
             row["event"] = "MONITOR_ERROR"
             row["error"] = f"monitor_loop_error: {exc}"
 
