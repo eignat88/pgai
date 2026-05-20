@@ -10,6 +10,7 @@ import argparse
 import csv
 import json
 import re
+import locale
 import subprocess
 import sys
 import time
@@ -95,10 +96,29 @@ class Logger:
             print(f"[ERROR] Failed to write JSONL log: {exc}", file=sys.stderr)
 
 
+def _decode_output(raw: bytes) -> str:
+    encodings = [
+        locale.getpreferredencoding(False),
+        "utf-8",
+        "cp866",
+        "cp1251",
+    ]
+    for encoding in encodings:
+        if not encoding:
+            continue
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 def run_command(command: list[str], timeout: int = 5) -> tuple[bool, str, str]:
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, shell=False)
-        return result.returncode == 0, result.stdout, result.stderr
+        result = subprocess.run(command, capture_output=True, text=False, timeout=timeout, shell=False)
+        stdout = _decode_output(result.stdout)
+        stderr = _decode_output(result.stderr)
+        return result.returncode == 0, stdout, stderr
     except Exception as exc:  # noqa: BLE001
         return False, "", str(exc)
 
