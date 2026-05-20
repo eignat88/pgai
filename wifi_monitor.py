@@ -144,6 +144,36 @@ def run_command(command: list[str], timeout: int = 5) -> tuple[bool, str, str]:
         return False, "", str(exc)
 
 
+WINDOWS_WIFI_KEY_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "state": ("state", "состояние"),
+    "ssid": ("ssid",),
+    "bssid": ("bssid",),
+    "signal": ("signal", "сигнал"),
+    "radio_type": ("radio type", "тип радиомодуля"),
+    "channel": ("channel", "канал"),
+    "rx_rate": (
+        "receive rate (mbps)",
+        "receive rate",
+        "скорость приема (мбит/с)",
+        "скорость приема",
+    ),
+    "tx_rate": (
+        "transmit rate (mbps)",
+        "transmit rate",
+        "скорость передачи (мбит/с)",
+        "скорость передачи",
+    ),
+}
+
+WINDOWS_WIFI_STATE_CONNECTED = {"connected", "подключено"}
+WINDOWS_WIFI_STATE_DISCONNECTED = {"disconnected", "отключено"}
+
+
+def normalize_windows_key(key: str) -> str:
+    normalized = re.sub(r"[\s\.]+", " ", key.strip().lower())
+    return normalized.strip(" :")
+
+
 def parse_windows_key_value_block(raw_text: str | None) -> dict[str, str]:
     parsed: dict[str, str] = {}
     if not raw_text:
@@ -153,7 +183,7 @@ def parse_windows_key_value_block(raw_text: str | None) -> dict[str, str]:
         if ":" not in line:
             continue
         key, value = line.split(":", 1)
-        parsed[key.strip().lower()] = value.strip()
+        parsed[normalize_windows_key(key)] = value.strip()
     return parsed
 
 
@@ -173,28 +203,42 @@ def collect_wifi_metrics() -> tuple[dict[str, Any], str | None]:
         }, f"ошибка netsh: {err or 'неизвестная ошибка'}"
 
     data = parse_windows_key_value_block(out)
-    # netsh output may include localized field names; these are english defaults.
-    state = data.get("state", "").strip().lower()
-    is_connected = state == "connected"
 
-    def get_field(*names: str) -> str:
-        for name in names:
-            value = data.get(name.lower())
+    def get_field(alias_name: str) -> str:
+        for synonym in WINDOWS_WIFI_KEY_SYNONYMS.get(alias_name, (alias_name,)):
+            value = data.get(normalize_windows_key(synonym))
             if value is not None:
                 return value
         return ""
 
-    return {
+    state = get_field("state").strip().lower()
+    if state in WINDOWS_WIFI_STATE_CONNECTED:
+        is_connected = True
+    elif state in WINDOWS_WIFI_STATE_DISCONNECTED:
+        is_connected = False
+    else:
+        is_connected = False
+
+    metrics = {
         "is_connected": is_connected,
         "connection_status": "CONNECTED" if is_connected else "DISCONNECTED",
-        "ssid": get_field("SSID"),
-        "bssid": get_field("BSSID"),
-        "signal": get_field("Signal"),
-        "radio_type": get_field("Radio type"),
-        "channel": get_field("Channel"),
-        "rx_rate": get_field("Receive rate (Mbps)", "Receive rate"),
-        "tx_rate": get_field("Transmit rate (Mbps)", "Transmit rate"),
-    }, None
+        "ssid": get_field("ssid"),
+        "bssid": get_field("bssid"),
+        "signal": get_field("signal"),
+        "radio_type": get_field("radio_type"),
+        "channel": get_field("channel"),
+        "rx_rate": get_field("rx_rate"),
+        "tx_rate": get_field("tx_rate"),
+    }
+
+    missing_aliases = [alias for alias in ("state", "signal", "radio_type") if not get_field(alias)]
+    diagnostics: list[str] = []
+    if state and state not in WINDOWS_WIFI_STATE_CONNECTED | WINDOWS_WIFI_STATE_DISCONNECTED:
+        diagnostics.append(f"неизвестное значение state='{state}'")
+    if missing_aliases:
+        diagnostics.append(f"не найдены ключи: {', '.join(missing_aliases)}")
+
+    return metrics, ("; ".join(diagnostics) if diagnostics else None)
 
 
 def parse_default_gateway() -> str | None:
