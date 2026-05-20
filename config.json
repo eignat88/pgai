@@ -1,0 +1,8 @@
+{
+  "check_interval_sec": 1,
+  "ping_targets": ["8.8.8.8", "1.1.1.1"],
+  "latency_threshold_ms": 1000,
+  "failures_before_outage": 3,
+  "log_format": "csv",
+  "log_file": "wifi_monitor_log.csv"
+}
