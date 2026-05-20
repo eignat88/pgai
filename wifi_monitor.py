@@ -32,21 +32,26 @@ CSV_FIELDS = [
     "timestamp",
     "ssid",
     "bssid",
-    "signal",
+    "connection_status",
+    "is_connected",
+    "ip_address",
+    "signal_percent",
+    "signal_dbm",
+    "signal_quality",
     "radio_type",
     "channel",
-    "rx_rate",
-    "tx_rate",
-    "connection_status",
+    "rx_rate_mbps",
+    "tx_rate_mbps",
     "ping_status",
     "latency_ms",
-    "packet_loss",
+    "packet_loss_percent",
     "target",
-    "is_connected",
     "is_internet_available",
+    "network_status",
     "error_count",
     "event",
     "error",
+    "comment",
 ]
 
 
@@ -58,6 +63,7 @@ class MonitorState:
     previous_internet: bool | None = None
     outage_active: bool = False
     consecutive_failures: int = 0
+    outage_started_at: float | None = None
 
 
 @dataclass
@@ -115,23 +121,24 @@ def parse_windows_key_value_block(raw_text: str) -> dict[str, str]:
 
 def collect_wifi_metrics() -> tuple[dict[str, Any], str | None]:
     ok, out, err = run_command(["netsh", "wlan", "show", "interfaces"])
+    Path("raw_netsh.txt").write_text(out or err or "", encoding="utf-8")
     if not ok:
         return {
             "is_connected": False,
             "connection_status": "DISCONNECTED",
             "ssid": "",
             "bssid": "",
-            "signal": "",
+            "signal_percent": "",
             "radio_type": "",
             "channel": "",
             "rx_rate": "",
             "tx_rate": "",
+            "ip_address": "",
         }, f"netsh_error: {err or 'unknown error'}"
 
     data = parse_windows_key_value_block(out)
-    # netsh output may include localized field names; these are english defaults.
-    state = data.get("state", "").strip().lower()
-    is_connected = state == "connected"
+    state_raw = data.get("state", data.get("состояние", "")).strip().lower()
+    is_connected_by_state = state_raw in {"connected", "подключено"}
 
     def get_field(*names: str) -> str:
         for name in names:
@@ -140,17 +147,75 @@ def collect_wifi_metrics() -> tuple[dict[str, Any], str | None]:
                 return value
         return ""
 
+    ip_ok, ip_out, _ = run_command(["ipconfig"])
+    ip_address = ""
+    if ip_ok:
+        ip_match = re.search(r"(?:IPv4 Address|IPv4-адрес)[ .:]*([\d.]+)", ip_out)
+        if ip_match:
+            ip_address = ip_match.group(1)
+
+    ssid = get_field("SSID")
+    bssid = get_field("BSSID")
+    rx_rate = get_field("Receive rate (Mbps)", "Receive rate", "Скорость приема (Мбит/с)", "Скорость приема")
+    tx_rate = get_field("Transmit rate (Mbps)", "Transmit rate", "Скорость передачи (Мбит/с)", "Скорость передачи")
+    signal = get_field("Signal", "Сигнал")
+    radio_type = get_field("Radio type", "Тип радио", "Тип радиомодуля")
+    channel = get_field("Channel", "Канал")
+
+    has_link = bool(ssid and bssid and ip_address)
+    is_connected = is_connected_by_state or has_link
+
     return {
         "is_connected": is_connected,
-        "connection_status": "CONNECTED" if is_connected else "DISCONNECTED",
+        "connection_status": "CONNECTED" if is_connected else "UNKNOWN",
         "ssid": get_field("SSID"),
         "bssid": get_field("BSSID"),
-        "signal": get_field("Signal"),
-        "radio_type": get_field("Radio type"),
-        "channel": get_field("Channel"),
-        "rx_rate": get_field("Receive rate (Mbps)", "Receive rate"),
-        "tx_rate": get_field("Transmit rate (Mbps)", "Transmit rate"),
+        "signal_percent": signal,
+        "radio_type": radio_type,
+        "channel": channel,
+        "rx_rate": rx_rate,
+        "tx_rate": tx_rate,
+        "ip_address": ip_address,
     }, None
+
+
+def signal_to_dbm(signal_percent: str) -> int | None:
+    match = re.search(r"(\d+)", str(signal_percent))
+    if not match:
+        return None
+    percent = int(match.group(1))
+    return int((percent / 2) - 100)
+
+
+def classify_signal(signal_dbm: int | None) -> str:
+    if signal_dbm is None:
+        return "Не определено"
+    if signal_dbm >= -60:
+        return "Отличный"
+    if signal_dbm >= -67:
+        return "Хороший"
+    if signal_dbm >= -75:
+        return "Слабый"
+    return "Плохой"
+
+
+def evaluate_network_status(row: dict[str, Any], latency_threshold_ms: int) -> tuple[str, str]:
+    if row.get("inconsistent_state"):
+        return "Ошибка анализа", "Противоречивое состояние: интернет доступен, но Wi-Fi отмечен как отключенный"
+    if row.get("connection_status") == "DISCONNECTED":
+        return "Wi-Fi отключен", "Нет активного подключения Wi-Fi"
+    if row.get("connection_status") == "UNKNOWN" and not row["is_connected"]:
+        return "Ошибка анализа", "Не удалось надежно определить состояние Wi-Fi"
+    if row["ping_status"] != "OK":
+        return "Нет интернета", "Wi-Fi подключен, но ping не проходит"
+    latency = row.get("latency_ms")
+    loss = str(row.get("packet_loss", "")).replace("%", "")
+    loss_int = int(loss) if loss.isdigit() else 0
+    if (isinstance(latency, int) and latency > latency_threshold_ms) or loss_int > 0:
+        return "Нестабильная сеть", "Повышенная задержка или потери пакетов"
+    if row.get("signal_quality") in {"Слабый", "Плохой"}:
+        return "Слабый сигнал", "Низкий уровень сигнала"
+    return "Нормально", "Wi-Fi и интернет работают стабильно"
 
 
 def parse_default_gateway() -> str | None:
@@ -219,11 +284,17 @@ def detect_event(state: MonitorState, row: dict[str, Any], failures_before_outag
     if state.previous_internet is False and internet:
         events.append("INTERNET_RESTORED")
 
-    if not state.outage_active and state.consecutive_failures >= failures_before_outage:
+    should_start_outage = (
+        (not connected and not internet) or (row["ping_status"] == "FAIL" and state.consecutive_failures >= failures_before_outage)
+    ) and not row.get("inconsistent_state")
+
+    if not state.outage_active and should_start_outage:
         state.outage_active = True
+        state.outage_started_at = time.time()
         events.append("OUTAGE_STARTED")
     elif state.outage_active and state.consecutive_failures == 0:
         state.outage_active = False
+        state.outage_started_at = None
         events.append("OUTAGE_ENDED")
 
     state.previous_connected = connected
@@ -298,21 +369,26 @@ def main() -> int:
             "timestamp": timestamp,
             "ssid": "",
             "bssid": "",
-            "signal": "",
+            "signal_percent": "",
             "radio_type": "",
             "channel": "",
             "rx_rate": "",
             "tx_rate": "",
-            "connection_status": "DISCONNECTED",
+            "connection_status": "UNKNOWN",
             "ping_status": "FAIL",
             "latency_ms": "",
             "packet_loss": "",
             "target": "",
             "is_connected": False,
             "is_internet_available": False,
+            "ip_address": "",
             "error_count": 0,
             "event": "",
             "error": "",
+            "parsing_error": "",
+            "inconsistent_state": False,
+            "roaming_detected": False,
+            "outage_duration_sec": 0,
         }
 
         try:
@@ -320,14 +396,33 @@ def main() -> int:
             row.update(wifi_metrics)
             if wifi_error:
                 row["error"] = wifi_error
+                row["parsing_error"] = wifi_error
 
             ping_result = choose_ping_result(targets)
             row.update(ping_result)
 
             internet_ok = row["ping_status"] == "OK"
             row["is_internet_available"] = internet_ok
+            row["is_connected"] = bool(
+                row.get("connection_status") == "CONNECTED"
+                or (row.get("ssid") and row.get("bssid") and row.get("ip_address"))
+                or (row.get("ssid") and row.get("bssid") and internet_ok)
+            )
+            if row["connection_status"] == "UNKNOWN":
+                row["connection_status"] = "CONNECTED" if row["is_connected"] else "DISCONNECTED"
 
-            failed = (not row["is_connected"]) or (not row["ssid"]) or (not internet_ok)
+            row["inconsistent_state"] = bool(internet_ok and not row["is_connected"])
+            row["roaming_detected"] = bool(
+                state.previous_bssid and row["bssid"] and state.previous_bssid != row["bssid"]
+            )
+
+            signal_dbm = signal_to_dbm(str(row["signal_percent"]))
+            row["signal_dbm"] = signal_dbm if signal_dbm is not None else ""
+            row["signal_quality"] = classify_signal(signal_dbm)
+            row["network_status"], comment = evaluate_network_status(row, latency_threshold_ms)
+            row["network_quality"] = row["network_status"]
+
+            failed = not internet_ok
             latency = row.get("latency_ms")
             if isinstance(latency, int) and latency > latency_threshold_ms:
                 failed = True
@@ -336,14 +431,67 @@ def main() -> int:
             row["error_count"] = state.consecutive_failures
 
             row["event"] = detect_event(state, row, failures_before_outage, latency_threshold_ms)
+            if row["inconsistent_state"]:
+                row["event"] = "INCONSISTENT_STATE"
+                row["error"] = "Противоречивое состояние: интернет доступен, но Wi-Fi отмечен как отключенный"
+            if state.outage_active and state.outage_started_at:
+                row["outage_duration_sec"] = int(time.time() - state.outage_started_at)
+
+            csv_row = {
+                "timestamp": row["timestamp"],
+                "ssid": row["ssid"],
+                "bssid": row["bssid"],
+                "connection_status": row["connection_status"],
+                "is_connected": row["is_connected"],
+                "ip_address": row["ip_address"],
+                "signal_percent": row["signal_percent"],
+                "signal_dbm": row["signal_dbm"],
+                "signal_quality": row["signal_quality"],
+                "radio_type": row["radio_type"],
+                "channel": row["channel"],
+                "rx_rate_mbps": row["rx_rate"],
+                "tx_rate_mbps": row["tx_rate"],
+                "ping_status": row["ping_status"],
+                "latency_ms": row["latency_ms"],
+                "packet_loss_percent": row["packet_loss"],
+                "target": row["target"],
+                "is_internet_available": row["is_internet_available"],
+                "network_status": row["network_status"],
+                "error_count": row["error_count"],
+                "event": row["event"],
+                "error": row["error"],
+                "comment": comment,
+            }
 
         except Exception as exc:  # noqa: BLE001
             state.consecutive_failures += 1
-            row["error_count"] = state.consecutive_failures
-            row["event"] = "MONITOR_ERROR"
-            row["error"] = f"monitor_loop_error: {exc}"
+            csv_row = {
+                "timestamp": timestamp,
+                "ssid": "",
+                "bssid": "",
+                "connection_status": "UNKNOWN",
+                "is_connected": False,
+                "ip_address": "",
+                "signal_percent": "",
+                "signal_dbm": "",
+                "signal_quality": "Не определено",
+                "radio_type": "",
+                "channel": "",
+                "rx_rate_mbps": "",
+                "tx_rate_mbps": "",
+                "ping_status": "FAIL",
+                "latency_ms": "",
+                "packet_loss_percent": "",
+                "target": "",
+                "is_internet_available": False,
+                "network_status": "Ошибка анализа",
+                "error_count": state.consecutive_failures,
+                "event": "MONITOR_ERROR",
+                "error": str(exc),
+                "comment": f"monitor_loop_error: {exc}",
+            }
 
-        logger.log(row)
+        logger.log(csv_row)
 
         elapsed = time.time() - loop_started
         time.sleep(max(0.0, interval - elapsed))
