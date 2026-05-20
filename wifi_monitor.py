@@ -103,8 +103,11 @@ def run_command(command: list[str], timeout: int = 5) -> tuple[bool, str, str]:
         return False, "", str(exc)
 
 
-def parse_windows_key_value_block(raw_text: str) -> dict[str, str]:
+def parse_windows_key_value_block(raw_text: str | None) -> dict[str, str]:
     parsed: dict[str, str] = {}
+    if not raw_text:
+        return parsed
+
     for line in raw_text.splitlines():
         if ":" not in line:
             continue
