@@ -33,10 +33,14 @@ CSV_FIELDS = [
     "timestamp",
     "ssid",
     "bssid",
-    "signal",
     "signal_percent",
     "signal_dbm",
     "signal_quality",
+    "internet_available",
+    "network_status",
+    "fail_count",
+    "comment",
+    "signal",
     "radio_type",
     "channel",
     "rx_rate",
@@ -47,13 +51,9 @@ CSV_FIELDS = [
     "packet_loss",
     "target",
     "is_connected",
-    "is_internet_available",
     "error_count",
-    "fail_count",
-    "network_status",
     "outage_duration_sec",
     "event",
-    "comment",
     "description",
     "severity",
     "error",
@@ -93,10 +93,21 @@ class Logger:
                 writer = csv.DictWriter(file_obj, fieldnames=CSV_FIELDS)
                 if not exists:
                     writer.writeheader()
-                writer.writerow({k: row.get(k, "") for k in CSV_FIELDS})
+                writer.writerow(self._prepare_csv_row(row))
             self._csv_initialized = True
         except Exception as exc:  # noqa: BLE001
             print(f"[ОШИБКА] Не удалось записать CSV-лог: {exc}", file=sys.stderr)
+
+    def _prepare_csv_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        csv_row = {k: row.get(k, "") for k in CSV_FIELDS}
+        if isinstance(csv_row.get("internet_available"), bool):
+            csv_row["internet_available"] = "Да" if csv_row["internet_available"] else "Нет"
+        if isinstance(csv_row.get("is_connected"), bool):
+            csv_row["is_connected"] = "Да" if csv_row["is_connected"] else "Нет"
+        packet_loss = row.get("packet_loss")
+        if isinstance(packet_loss, (int, float)):
+            csv_row["packet_loss"] = f"{packet_loss:.0f}%"
+        return csv_row
 
     def _write_jsonl(self, row: dict[str, Any]) -> None:
         try:
@@ -200,8 +211,8 @@ def ping_target(target: str) -> dict[str, Any]:
         return {
             "target": target,
             "ping_status": "FAIL",
-            "latency_ms": "",
-            "packet_loss": "100%",
+            "latency_ms": None,
+            "packet_loss": 100.0,
             "error": f"ошибка ping: {err or 'неизвестная ошибка'}",
         }
 
@@ -212,8 +223,8 @@ def ping_target(target: str) -> dict[str, Any]:
     return {
         "target": target,
         "ping_status": "OK" if success else "FAIL",
-        "latency_ms": int(time_match.group(1)) if time_match else "",
-        "packet_loss": f"{loss_match.group(1)}%" if loss_match else "",
+        "latency_ms": int(time_match.group(1)) if time_match else None,
+        "packet_loss": float(loss_match.group(1)) if loss_match else None,
         "error": "" if success else (err.strip() or "пинг не выполнен"),
     }
 
@@ -225,7 +236,7 @@ def choose_ping_result(targets: list[str]) -> dict[str, Any]:
         if result["ping_status"] == "OK":
             return result
         failures.append(result)
-    return failures[0] if failures else {"target": "", "ping_status": "FAIL", "latency_ms": "", "packet_loss": "", "error": "нет целей для пинга"}
+    return failures[0] if failures else {"target": "", "ping_status": "FAIL", "latency_ms": None, "packet_loss": None, "error": "нет целей для пинга"}
 
 
 def parse_signal_percent(signal: str) -> int | None:
@@ -257,7 +268,7 @@ def resolve_network_status(
 ) -> str:
     if not row.get("is_connected"):
         return "Wi‑Fi отключен"
-    if row.get("ping_status") == "FAIL" or not row.get("is_internet_available"):
+    if row.get("ping_status") == "FAIL" or not row.get("internet_available"):
         return "Нет интернета"
     latency = row.get("latency_ms")
     if isinstance(latency, int) and latency > latency_threshold_ms:
@@ -273,7 +284,7 @@ def resolve_network_status(
 def detect_event(state: MonitorState, row: dict[str, Any], failures_before_outage: int, latency_threshold_ms: int) -> str:
     events: list[str] = []
     connected = bool(row["is_connected"])
-    internet = bool(row["is_internet_available"])
+    internet = bool(row["internet_available"])
 
     if state.previous_connected is False and connected:
         events.append("Подключение к Wi‑Fi")
@@ -430,23 +441,23 @@ def main() -> int:
             "signal_percent": "",
             "signal_dbm": "",
             "signal_quality": "",
+            "internet_available": False,
+            "network_status": "Нормально",
+            "fail_count": 0,
+            "comment": "",
             "radio_type": "",
             "channel": "",
             "rx_rate": "",
             "tx_rate": "",
             "connection_status": "DISCONNECTED",
             "ping_status": "FAIL",
-            "latency_ms": "",
-            "packet_loss": "",
+            "latency_ms": None,
+            "packet_loss": None,
             "target": "",
             "is_connected": False,
-            "is_internet_available": False,
             "error_count": 0,
-            "fail_count": 0,
-            "network_status": "Нормально",
             "outage_duration_sec": 0,
             "event": "",
-            "comment": "",
             "description": "",
             "severity": "info",
             "error": "",
@@ -462,7 +473,7 @@ def main() -> int:
             row.update(ping_result)
 
             internet_ok = row["ping_status"] == "OK"
-            row["is_internet_available"] = internet_ok
+            row["internet_available"] = internet_ok
 
             signal_percent = parse_signal_percent(str(row.get("signal", "")))
             if signal_percent is not None:
