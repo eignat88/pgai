@@ -53,6 +53,9 @@ CSV_FIELDS = [
     "network_status",
     "outage_duration_sec",
     "event",
+    "comment",
+    "description",
+    "severity",
     "error",
 ]
 
@@ -93,14 +96,14 @@ class Logger:
                 writer.writerow({k: row.get(k, "") for k in CSV_FIELDS})
             self._csv_initialized = True
         except Exception as exc:  # noqa: BLE001
-            print(f"[ERROR] Failed to write CSV log: {exc}", file=sys.stderr)
+            print(f"[ОШИБКА] Не удалось записать CSV-лог: {exc}", file=sys.stderr)
 
     def _write_jsonl(self, row: dict[str, Any]) -> None:
         try:
             with self.log_path.open("a", encoding="utf-8") as file_obj:
                 file_obj.write(json.dumps(row, ensure_ascii=False) + "\n")
         except Exception as exc:  # noqa: BLE001
-            print(f"[ERROR] Failed to write JSONL log: {exc}", file=sys.stderr)
+            print(f"[ОШИБКА] Не удалось записать JSONL-лог: {exc}", file=sys.stderr)
 
 
 def _decode_output(raw: bytes) -> str:
@@ -156,7 +159,7 @@ def collect_wifi_metrics() -> tuple[dict[str, Any], str | None]:
             "channel": "",
             "rx_rate": "",
             "tx_rate": "",
-        }, f"netsh_error: {err or 'unknown error'}"
+        }, f"ошибка netsh: {err or 'неизвестная ошибка'}"
 
     data = parse_windows_key_value_block(out)
     # netsh output may include localized field names; these are english defaults.
@@ -199,7 +202,7 @@ def ping_target(target: str) -> dict[str, Any]:
             "ping_status": "FAIL",
             "latency_ms": "",
             "packet_loss": "100%",
-            "error": f"ping_error: {err or 'unknown error'}",
+            "error": f"ошибка ping: {err or 'неизвестная ошибка'}",
         }
 
     loss_match = re.search(r"\((\d+)% loss\)", out)
@@ -211,7 +214,7 @@ def ping_target(target: str) -> dict[str, Any]:
         "ping_status": "OK" if success else "FAIL",
         "latency_ms": int(time_match.group(1)) if time_match else "",
         "packet_loss": f"{loss_match.group(1)}%" if loss_match else "",
-        "error": "" if success else (err.strip() or "ping_failed"),
+        "error": "" if success else (err.strip() or "пинг не выполнен"),
     }
 
 
@@ -222,7 +225,7 @@ def choose_ping_result(targets: list[str]) -> dict[str, Any]:
         if result["ping_status"] == "OK":
             return result
         failures.append(result)
-    return failures[0] if failures else {"target": "", "ping_status": "FAIL", "latency_ms": "", "packet_loss": "", "error": "no_targets"}
+    return failures[0] if failures else {"target": "", "ping_status": "FAIL", "latency_ms": "", "packet_loss": "", "error": "нет целей для пинга"}
 
 
 def parse_signal_percent(signal: str) -> int | None:
@@ -273,58 +276,111 @@ def detect_event(state: MonitorState, row: dict[str, Any], failures_before_outag
     internet = bool(row["is_internet_available"])
 
     if state.previous_connected is False and connected:
-        events.append("WIFI_CONNECTED")
+        events.append("Подключение к Wi‑Fi")
     if state.previous_connected is True and not connected:
-        events.append("WIFI_DISCONNECTED")
+        events.append("Отключение Wi‑Fi")
 
     if connected and state.previous_ssid and row["ssid"] and state.previous_ssid != row["ssid"]:
-        events.append("SSID_CHANGED")
+        events.append("Смена SSID")
     if connected and state.previous_bssid and row["bssid"] and state.previous_bssid != row["bssid"]:
-        events.append("BSSID_CHANGED")
+        events.append("Смена BSSID")
 
     if row["ping_status"] == "FAIL":
-        events.append("PING_FAIL")
+        events.append("Потери пакетов")
     latency = row.get("latency_ms")
     if isinstance(latency, int) and latency > latency_threshold_ms:
-        events.append("HIGH_LATENCY")
+        events.append("Высокая задержка")
 
     if state.previous_internet is False and internet:
-        events.append("INTERNET_RESTORED")
+        events.append("Восстановление сети")
 
     if not state.outage_active and state.consecutive_failures >= failures_before_outage:
         state.outage_active = True
-        events.append("OUTAGE_STARTED")
+        events.append("Начало обрыва")
     elif state.outage_active and state.consecutive_failures == 0:
         state.outage_active = False
-        events.append("OUTAGE_ENDED")
+        events.append("Восстановление сети")
 
     state.previous_connected = connected
     state.previous_ssid = str(row["ssid"] or "")
     state.previous_bssid = str(row["bssid"] or "")
     state.previous_internet = internet
 
-    return "|".join(events)
+    signal_dbm = row.get("signal_dbm")
+    if isinstance(signal_dbm, int) and signal_dbm < -75:
+        events.append("Слабый сигнал")
 
+    return "|".join(dict.fromkeys(events))
+
+
+
+
+def build_event_metadata(row: dict[str, Any]) -> tuple[str, str, str]:
+    events = [event.strip() for event in str(row.get("event", "")).split("|") if event.strip()]
+
+    if row.get("error"):
+        return (
+            "Зафиксирована ошибка выполнения диагностических команд.",
+            f"Диагностика сети завершилась ошибкой: {row['error']}",
+            "error",
+        )
+
+    if "Начало обрыва" in events or row.get("ping_status") == "FAIL":
+        return (
+            "Обнаружены потери доступности сети или пакетов.",
+            "Началась деградация: отсутствует интернет-связность или потери пакетов.",
+            "error",
+        )
+
+    if "Высокая задержка" in events:
+        return (
+            "Задержка превышает допустимый порог.",
+            "Качество сети ухудшено из-за высокой задержки ответа.",
+            "warn",
+        )
+
+    if "Слабый сигнал" in events:
+        return (
+            "Уровень сигнала Wi-Fi ниже рекомендуемого.",
+            "Качество сети ухудшено из-за слабого сигнала Wi-Fi.",
+            "warn",
+        )
+
+    if "Отключение Wi‑Fi" in events:
+        return (
+            "Wi-Fi соединение разорвано.",
+            "Соединение с точкой доступа Wi-Fi потеряно.",
+            "warn",
+        )
+
+    if "Подключение к Wi‑Fi" in events or "Восстановление сети" in events:
+        return (
+            "Сетевое подключение доступно.",
+            "Подключение к сети активно и интернет доступен.",
+            "info",
+        )
+
+    return ("Отклонений не обнаружено.", "Сеть работает в штатном режиме.", "info")
 
 def load_config(path: Path | None) -> dict[str, Any]:
     config = DEFAULT_CONFIG.copy()
     if path is None:
         return config
     if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
+        raise FileNotFoundError(f"Файл конфигурации не найден: {path}")
     with path.open(encoding="utf-8") as file_obj:
         loaded = json.load(file_obj)
     if not isinstance(loaded, dict):
-        raise ValueError("Config must be a JSON object")
+        raise ValueError("Конфигурация должна быть JSON-объектом")
     config.update(loaded)
     return config
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Windows Wi-Fi monitor script")
-    parser.add_argument("--config", type=Path, help="Path to config.json")
-    parser.add_argument("--log", type=Path, help="Override log file path")
-    parser.add_argument("--interval", type=float, help="Override check interval in seconds")
+    parser = argparse.ArgumentParser(description="Скрипт мониторинга Wi-Fi для Windows")
+    parser.add_argument("--config", type=Path, help="Путь к config.json")
+    parser.add_argument("--log", type=Path, help="Переопределить путь к лог-файлу")
+    parser.add_argument("--interval", type=float, help="Переопределить интервал проверки в секундах")
     return parser.parse_args()
 
 
@@ -333,7 +389,7 @@ def main() -> int:
     try:
         config = load_config(args.config)
     except Exception as exc:  # noqa: BLE001
-        print(f"[ERROR] Failed to load config: {exc}", file=sys.stderr)
+        print(f"[ОШИБКА] Не удалось загрузить конфигурацию: {exc}", file=sys.stderr)
         return 1
 
     if args.log:
@@ -348,7 +404,7 @@ def main() -> int:
     log_file = Path(str(config.get("log_file", "wifi_monitor_log.csv")))
 
     if log_format not in {"csv", "jsonl"}:
-        print("[WARN] Unknown log_format, falling back to csv", file=sys.stderr)
+        print("[ПРЕДУПРЕЖДЕНИЕ] Неизвестный log_format, используется csv", file=sys.stderr)
         log_format = "csv"
 
     targets = list(config.get("ping_targets", []))
@@ -361,7 +417,7 @@ def main() -> int:
     logger = Logger(log_file, log_format)
     state = MonitorState()
 
-    print(f"Starting Wi-Fi monitor. Interval={interval}s, log={log_file}, format={log_format}")
+    print(f"Запуск монитора Wi-Fi. Интервал={interval}с, лог={log_file}, формат={log_format}")
 
     while True:
         loop_started = time.time()
@@ -390,6 +446,9 @@ def main() -> int:
             "network_status": "Нормально",
             "outage_duration_sec": 0,
             "event": "",
+            "comment": "",
+            "description": "",
+            "severity": "info",
             "error": "",
         }
 
@@ -437,6 +496,7 @@ def main() -> int:
                 row["outage_duration_sec"] = 0
 
             row["event"] = detect_event(state, row, failures_before_outage, latency_threshold_ms)
+            row["comment"], row["description"], row["severity"] = build_event_metadata(row)
 
         except Exception as exc:  # noqa: BLE001
             state.consecutive_failures += 1
@@ -446,8 +506,11 @@ def main() -> int:
             if state.outage_started_at is None:
                 state.outage_started_at = time.time()
             row["outage_duration_sec"] = int(time.time() - state.outage_started_at)
-            row["event"] = "MONITOR_ERROR"
-            row["error"] = f"monitor_loop_error: {exc}"
+            row["event"] = "Ошибка мониторинга"
+            row["comment"] = "Ошибка в цикле мониторинга."
+            row["description"] = f"Ошибка обработки метрик: {exc}"
+            row["severity"] = "error"
+            row["error"] = f"ошибка цикла мониторинга: {exc}"
 
         logger.log(row)
 
@@ -459,5 +522,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        print("Stopped by user")
+        print("Остановлено пользователем")
         raise SystemExit(0)
